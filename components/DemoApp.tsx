@@ -832,7 +832,7 @@ function Flow({
               automatically.
             </p>
           </div>
-          {hasHistory && (
+          {phase === "source" && hasHistory && (
             <HistoryMenuButton
               open={historyOpen}
               setOpen={setHistoryOpen}
