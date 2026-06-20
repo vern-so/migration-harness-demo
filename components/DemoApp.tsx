@@ -16,13 +16,17 @@ import { Report } from "@/components/Report";
 import { Button } from "@/components/Button";
 import { AlertIcon, CloseIcon, DownloadIcon, HistoryIcon, ResetIcon, SparkIcon } from "@/components/Icons";
 
+// A user message plus the thread sequence it followed, so it can be replayed in
+// the right position on resume. Legacy persisted entries may be bare strings.
+type SavedUserMessage = { after: number; text: string };
+
 type Resumable = {
   migrationId: string;
   runId: string;
   runKind: "generate" | "update" | "execute";
   slugs: string[];
   after?: number;
-  userMessages?: string[];
+  userMessages?: (SavedUserMessage | string)[];
   status: string;
 };
 
@@ -119,6 +123,12 @@ function Flow({
   const currentRunIdRef = useRef<string | null>(null);
   const cursorRef = useRef<number | undefined>(undefined);
   const abortRef = useRef<AbortController | null>(null);
+  // User answers aren't stored server-side, so we persist them here (anchored to
+  // the thread position they followed) to replay on resume. Accumulates per run.
+  const userMessagesRef = useRef<SavedUserMessage[]>([]);
+  // True while replaying a thread snapshot, so live-only side effects (showing
+  // the question UI) are suppressed during history rebuild.
+  const isReplayingRef = useRef(false);
   // The `?step=` present on first load — captured before the URL-sync effect runs.
   const initialStepRef = useRef<string | null>(
     typeof window === "undefined" ? null : new URLSearchParams(window.location.search).get("step"),
@@ -154,7 +164,11 @@ function Flow({
           (saved.after == null || typeof saved.after === "number") &&
           (saved.userMessages == null ||
             (Array.isArray(saved.userMessages) &&
-              saved.userMessages.every((message) => typeof message === "string")));
+              saved.userMessages.every(
+                (message) =>
+                  typeof message === "string" ||
+                  (!!message && typeof message === "object" && typeof message.text === "string"),
+              )));
 
         if (!valid) {
           clearProgress();
@@ -292,8 +306,12 @@ function Flow({
     // getRun() to report it. Handled before userTextForEvent so it isn't
     // mis-rendered as a user message (its type matches the /input/i heuristic).
     if (ev.type === "request_input") {
-      const qs = questionsFromEvent(ev);
-      if (qs.length > 0) setQuestions(qs);
+      // During a history replay the question is reconciled against the run
+      // status afterwards, so don't surface it here (it may be answered).
+      if (!isReplayingRef.current) {
+        const qs = questionsFromEvent(ev);
+        if (qs.length > 0) setQuestions(qs);
+      }
       return;
     }
 
@@ -369,6 +387,7 @@ function Flow({
       const resumeAfter = cursorRef.current;
       setRunKind(kind);
       setFeed([]);
+      userMessagesRef.current = [];
       setQuestions([]);
       setAgentSettled(false);
       setAgentElapsed(0);
@@ -494,13 +513,19 @@ function Flow({
       setBusy(true);
       try {
         appendUserMessage(userText);
+        if (userText) {
+          userMessagesRef.current = [
+            ...userMessagesRef.current,
+            { after: resumeAfter ?? -1, text: userText },
+          ];
+        }
         saveProgress({
           migrationId,
           runId,
           runKind,
           slugs: selectedSlugs,
           after: resumeAfter,
-          userMessages: userText ? [userText] : undefined,
+          userMessages: userMessagesRef.current,
         });
         await client.answerQuestions(migrationId, runId, answers);
         setAgentSettled(false);
@@ -604,6 +629,7 @@ function Flow({
       setRunKind("generate");
       setFeed([]);
       appendUserMessage(userText);
+      userMessagesRef.current = [{ after: resumeAfter ?? -1, text: userText }];
       setQuestions([]);
       setAgentSettled(false);
       setAgentElapsed(0);
@@ -621,7 +647,7 @@ function Flow({
           runKind: "update",
           slugs: selectedSlugs,
           after: resumeAfter,
-          userMessages: [userText],
+          userMessages: userMessagesRef.current,
         });
         await rememberMigration(migrationId, {
           current_run_id: started.run_id,
@@ -676,19 +702,39 @@ function Flow({
     setAgentElapsed(0);
     setPreviewReady(false);
     setPhase("agent");
+
+    // User answers aren't stored server-side, so replay them from local history.
+    // Seed the ref too, so further answers in this resumed session accumulate.
+    const savedMsgs = normalizeUserMessages(userMessages, after);
+    userMessagesRef.current = savedMsgs;
+
+    let lastReplayedQuestions: AgentQuestion[] = [];
     try {
       // Replay the full thread from the start so the user sees the entire
-      // history (not just events after the last-seen cursor), then continue live.
+      // history (not just events after the last-seen cursor), interleaving their
+      // persisted answers at the thread position each one followed.
       const snap = await client.getThreadSnapshot(mId, { include: "all" }).catch(() => null);
       if (snap?.events?.length) {
-        snap.events.forEach(handleEvent);
+        const pendingMsgs = [...savedMsgs].sort((a, b) => a.after - b.after);
+        isReplayingRef.current = true;
+        snap.events.forEach((ev) => {
+          // Inject any answer anchored before this event (it followed an earlier one).
+          while (pendingMsgs.length && pendingMsgs[0].after < ev.sequence) {
+            appendUserMessage(pendingMsgs.shift()!.text);
+          }
+          if (ev.type === "request_input") lastReplayedQuestions = questionsFromEvent(ev);
+          handleEvent(ev);
+        });
+        // Answers anchored past the last replayed event (e.g. to the final question).
+        pendingMsgs.forEach((m) => appendUserMessage(m.text));
+        isReplayingRef.current = false;
         const firstTs = snap.events[0]?.created_at ? Date.parse(snap.events[0].created_at) : NaN;
         if (!Number.isNaN(firstTs)) {
           setAgentElapsed(Math.max(0, Math.floor((Date.now() - firstTs) / 1000)));
         }
       } else {
         // No thread snapshot available — fall back to the persisted messages.
-        setFeed((userMessages || []).map((text): FeedItem => ({ kind: "user", text })));
+        setFeed(savedMsgs.map((m): FeedItem => ({ kind: "user", text: m.text })));
       }
       if (typeof snap?.last_sequence === "number") cursorRef.current = snap.last_sequence;
       let run = await client.getRun(mId, runId);
@@ -697,22 +743,34 @@ function Flow({
         run = await client.getRun(mId, runId);
       }
       setAgentSettled(true);
-      if (run.status === "awaiting_approval") setPreviewReady(true);
-      else if (run.status === "blocked") setQuestions((prev) => (run.questions?.length ? run.questions : prev));
-      else if (run.status === "completed") {
-        setReport(run.report);
+      // Only show a question if the run is *currently* blocked. A request_input
+      // replayed from history may already have been answered.
+      if (run.status === "blocked") {
+        setQuestions(run.questions?.length ? run.questions : lastReplayedQuestions);
         await rememberMigration(mId, {
-          status: "completed",
-          report: run.report ?? null,
+          status: "blocked",
           last_thread_sequence: cursorRef.current ?? null,
         });
-        setPhase("done");
-        clearProgress();
       } else {
-        clearProgress();
-        throw new Error("This import is no longer available. Please start a new one.");
+        setQuestions([]);
+        if (run.status === "awaiting_approval") {
+          setPreviewReady(true);
+        } else if (run.status === "completed") {
+          setReport(run.report);
+          await rememberMigration(mId, {
+            status: "completed",
+            report: run.report ?? null,
+            last_thread_sequence: cursorRef.current ?? null,
+          });
+          setPhase("done");
+          clearProgress();
+        } else {
+          clearProgress();
+          throw new Error("This import is no longer available. Please start a new one.");
+        }
       }
     } catch (e) {
+      isReplayingRef.current = false;
       fail(e);
       setPhase("source");
     }
@@ -741,6 +799,7 @@ function Flow({
     abortRef.current = null;
     currentRunIdRef.current = null;
     cursorRef.current = undefined;
+    userMessagesRef.current = [];
     clearProgress();
     setResumable(null);
     setMigrationId(null);
@@ -1545,6 +1604,25 @@ function textFromUnknown(value: unknown): string | null {
     return text.trim() || null;
   }
   return null;
+}
+
+// Normalize persisted user messages to { after, text }. Legacy entries were bare
+// strings without a thread anchor; fall back to the run's saved cursor for those.
+function normalizeUserMessages(
+  raw: (SavedUserMessage | string)[] | undefined,
+  fallbackAfter: number | undefined,
+): SavedUserMessage[] {
+  if (!Array.isArray(raw)) return [];
+  const anchor = typeof fallbackAfter === "number" ? fallbackAfter : -1;
+  return raw
+    .map((m): SavedUserMessage | null => {
+      if (typeof m === "string") return m.trim() ? { after: anchor, text: m } : null;
+      if (m && typeof m === "object" && typeof m.text === "string") {
+        return { after: typeof m.after === "number" ? m.after : anchor, text: m.text };
+      }
+      return null;
+    })
+    .filter((m): m is SavedUserMessage => m !== null);
 }
 
 // Extract clarifying questions from a live `request_input` thread event. Parsed
