@@ -1,12 +1,23 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+/* Base font token — Tailwind v4 applies this to the document via preflight. */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Brand color utilities (bg-brand, text-brand-fg, …) resolve to the runtime
+   CSS variables below, which Gate/DemoApp override per-prospect at runtime.
+   `inline` keeps the var reference live so those overrides take effect. */
+@theme inline {
+  --color-brand: var(--brand);
+  --color-brand-fg: var(--brand-fg);
+  --color-brand-soft: var(--brand-soft);
+}
 
 :root {
   --brand: #4f46e5;
   --brand-fg: #ffffff;
   --brand-soft: rgba(79, 70, 229, 0.1);
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
 html,
