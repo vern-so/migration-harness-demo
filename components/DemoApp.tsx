@@ -620,6 +620,24 @@ function Flow({
     }
   }, [client, migrationId, selectedSlugs, streamCurrent, saveProgress, rememberMigration, clearProgress]);
 
+  // Demo-only stand-in for `execute`. The live "Import" commits over the Vern
+  // API; that button is disabled in this demo, so instead of calling the API we
+  // synthesize the completion screen straight from the validated preview — the
+  // numbers the user is already looking at — so the flow still runs end to end.
+  const pseudoExecute = useCallback(() => {
+    setError(null);
+    setBusy(true);
+    setRunKind("execute");
+    const inserted = preview.reduce((sum, s) => sum + s.total, 0);
+    const invalidCellCount = preview.reduce((sum, s) => sum + s.invalidCells, 0);
+    // A brief delay so the import reads as work being done, not an instant jump.
+    setTimeout(() => {
+      setReport({ inserted, invalidCellCount });
+      setPhase("done");
+      setBusy(false);
+    }, 1100);
+  }, [preview]);
+
   // "Fix": send free-text feedback to the agent as an `update` run, then let
   // the user view the refreshed preview when they are ready.
   const applyFix = useCallback(
@@ -1084,8 +1102,23 @@ function Flow({
               <Button variant="outline" onClick={() => setFixOpen((o) => !o)} disabled={busy}>
                 Fix
               </Button>
-              <Button onClick={execute} loading={busy}>
-                Import
+              {/* The live import commits over the Vern API (`execute`, wired and
+                  ready). It's disabled in this demo; the button beside it
+                  simulates the result from the validated preview instead. */}
+              <div className="group relative">
+                <Button onClick={execute} disabled>
+                  Import
+                </Button>
+                <span
+                  role="tooltip"
+                  className="pointer-events-none absolute bottom-full right-0 z-20 mb-2 w-64 rounded-lg bg-zinc-900 px-3 py-2 text-left text-[11px] leading-snug text-zinc-100 opacity-0 shadow-lg transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100"
+                >
+                  Wiring this to your live Vern API is a one-line change. This demo
+                  simulates the import from the validated preview.
+                </span>
+              </div>
+              <Button onClick={pseudoExecute} loading={busy}>
+                Simulate import
               </Button>
             </div>
           </div>
