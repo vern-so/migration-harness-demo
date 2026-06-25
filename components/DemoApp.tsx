@@ -2,14 +2,21 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { readableFg, softTint, type Brand } from "@/lib/branding";
-import type { AgentQuestion, DemoMigration, RunReport, SampleCsvFile, Source, Template, ThreadEvent } from "@/lib/types";
+import type { AgentQuestion, DemoMigration, Run, RunReport, SampleCsvFile, Source, Template, ThreadEvent } from "@/lib/types";
 import { ApiError, contentTypeFor, makeClient, type VernClient } from "@/lib/client";
+import {
+  credentialPromptFromEvent,
+  credentialPromptFromRun,
+  sourceKeyForName,
+  type CredentialPrompt,
+} from "@/lib/credentials";
 import { normalizePreview, type PreviewSheet } from "@/lib/preview";
 import { Shell } from "@/components/Shell";
 import { Stepper, type StepKey } from "@/components/Stepper";
 import { Dropzone } from "@/components/Dropzone";
 import { AgentActivity, type FeedItem } from "@/components/AgentActivity";
 import { Questions } from "@/components/Questions";
+import { SourceCredentials } from "@/components/SourceCredentials";
 import { toolDisplay } from "@/components/toolMap";
 import { Preview } from "@/components/Preview";
 import { Report } from "@/components/Report";
@@ -90,6 +97,9 @@ function Flow({
   const [agentElapsed, setAgentElapsed] = useState(0);
 
   const [questions, setQuestions] = useState<AgentQuestion[]>([]);
+  // A run can pause for a source-credential request instead of a question (the
+  // API-extractor path). Mutually exclusive with `questions`.
+  const [credentialPrompt, setCredentialPrompt] = useState<CredentialPrompt | null>(null);
   const [preview, setPreview] = useState<PreviewSheet[]>([]);
   const [previewReady, setPreviewReady] = useState(false);
   const [report, setReport] = useState<RunReport | undefined>(undefined);
@@ -306,9 +316,16 @@ function Flow({
     // getRun() to report it. Handled before userTextForEvent so it isn't
     // mis-rendered as a user message (its type matches the /input/i heuristic).
     if (ev.type === "request_input") {
-      // During a history replay the question is reconciled against the run
+      // During a history replay the request is reconciled against the run
       // status afterwards, so don't surface it here (it may be answered).
       if (!isReplayingRef.current) {
+        // A source-credential request rides the same event type as a question.
+        const cred = credentialPromptFromEvent(ev.data);
+        if (cred) {
+          setCredentialPrompt(cred);
+          setQuestions([]);
+          return;
+        }
         const qs = questionsFromEvent(ev);
         if (qs.length > 0) setQuestions(qs);
       }
@@ -383,18 +400,26 @@ function Flow({
 
   // Start a run and stream it; resets the visible feed for the new run.
   const runAndStream = useCallback(
-    async (mId: string, kind: "generate" | "execute") => {
+    async (mId: string, kind: "generate" | "execute", opts?: { extractViaApi?: boolean }) => {
       const resumeAfter = cursorRef.current;
       setRunKind(kind);
       setFeed([]);
       userMessagesRef.current = [];
       setQuestions([]);
+      setCredentialPrompt(null);
       setAgentSettled(false);
       setAgentElapsed(0);
       setPreviewReady(false);
       setError(null);
       setPhase("agent");
-      const started = await client.startRun(mId, kind);
+      // `extract_via_api` (generate only): false pins the run to uploaded files;
+      // true extracts from the migration's source connection (and blocks for
+      // credentials if they aren't configured yet). Default file-only.
+      const started = await client.startRun(
+        mId,
+        kind,
+        kind === "generate" ? { extract_via_api: opts?.extractViaApi ?? false } : undefined,
+      );
       currentRunIdRef.current = started.run_id;
       saveProgress({ migrationId: mId, runId: started.run_id, runKind: kind, slugs: selectedSlugs, after: resumeAfter });
       await rememberMigration(mId, {
@@ -417,6 +442,24 @@ function Flow({
       setPhase("review");
     },
     [client],
+  );
+
+  // A blocked run is waiting on either a source-credential request (the
+  // API-extractor path) or a clarifying question. Surface the right form.
+  const applyBlocked = useCallback(
+    async (mId: string, run: Run) => {
+      const cred =
+        run.blocked_reason === "credentials" ? credentialPromptFromRun(run.credential_request) : null;
+      if (cred) {
+        setCredentialPrompt(cred);
+        setQuestions([]);
+      } else {
+        setCredentialPrompt(null);
+        setQuestions((prev) => (run.questions?.length ? run.questions : prev));
+      }
+      await rememberMigration(mId, { status: "blocked", last_thread_sequence: cursorRef.current ?? null });
+    },
+    [rememberMigration],
   );
 
   const upload = useCallback(async () => {
@@ -457,11 +500,7 @@ function Flow({
           last_thread_sequence: cursorRef.current ?? null,
         });
       } else if (run.status === "blocked") {
-        setQuestions((prev) => (run.questions?.length ? run.questions : prev));
-        await rememberMigration(m.id, {
-          status: "blocked",
-          last_thread_sequence: cursorRef.current ?? null,
-        });
+        await applyBlocked(m.id, run);
       } else if (run.status === "failed" || run.status === "canceled") {
         await rememberMigration(m.id, { status: "failed", last_thread_sequence: cursorRef.current ?? null });
         throw new Error("That didn't complete. Please retry.");
@@ -472,7 +511,52 @@ function Flow({
     } finally {
       setBusy(false);
     }
-  }, [client, brand.product, selectedSource, selectedSlugs, files, runAndStream, rememberMigration, phase]);
+  }, [client, brand.product, selectedSource, selectedSlugs, files, runAndStream, rememberMigration, applyBlocked, phase]);
+
+  // Alternative to uploading files: pull the data straight from the selected
+  // source's API. Registers a source connection, then runs generate with
+  // `extract_via_api`; the agent pauses for the source's credentials, which the
+  // user enters in the credential form (in the agent thread).
+  const apiImport = useCallback(async () => {
+    if (!selectedSource) return;
+    setError(null);
+    setBusy(true);
+    try {
+      cursorRef.current = undefined;
+      const m = await client.createMigration({
+        name: `${brand.product} demo`,
+        source: selectedSource,
+        external_id: `demo-${Date.now()}`,
+        templates: selectedSlugs,
+      });
+      setMigrationId(m.id);
+      setPreview([]);
+      setPreviewReady(false);
+      // Register the source (no credentials yet) so the run can extract via API;
+      // the agent then asks the end-customer for them mid-run.
+      await client.saveSourceConnection(m.id, { source_key: sourceKeyForName(selectedSource) });
+      await runAndStream(m.id, "generate", { extractViaApi: true });
+      setAgentSettled(true);
+      const run = await client.getRun(m.id, currentRunIdRef.current!);
+      if (run.status === "awaiting_approval") {
+        setPreviewReady(true);
+        await rememberMigration(m.id, {
+          status: "awaiting_review",
+          last_thread_sequence: cursorRef.current ?? null,
+        });
+      } else if (run.status === "blocked") {
+        await applyBlocked(m.id, run);
+      } else if (run.status === "failed" || run.status === "canceled") {
+        await rememberMigration(m.id, { status: "failed", last_thread_sequence: cursorRef.current ?? null });
+        throw new Error("That didn't complete. Please retry.");
+      }
+    } catch (e) {
+      fail(e);
+      if (phase !== "agent") setPhase("upload");
+    } finally {
+      setBusy(false);
+    }
+  }, [client, brand.product, selectedSource, selectedSlugs, runAndStream, rememberMigration, applyBlocked, phase]);
 
   const generateSampleData = useCallback(async () => {
     if (sampleGenerated || selectedTemplates.length === 0) return;
@@ -545,11 +629,7 @@ function Flow({
             last_thread_sequence: cursorRef.current ?? null,
           });
         } else if (run.status === "blocked") {
-          setQuestions((prev) => (run.questions?.length ? run.questions : prev));
-          await rememberMigration(migrationId, {
-            status: "blocked",
-            last_thread_sequence: cursorRef.current ?? null,
-          });
+          await applyBlocked(migrationId, run);
         }
       } catch (e) {
         setQuestions(pending); // restore the question UI so the user can retry
@@ -558,7 +638,55 @@ function Flow({
         setBusy(false);
       }
     },
-    [client, migrationId, questions, runKind, selectedSlugs, appendUserMessage, saveProgress, streamCurrent, rememberMigration],
+    [client, migrationId, questions, runKind, selectedSlugs, appendUserMessage, saveProgress, streamCurrent, rememberMigration, applyBlocked],
+  );
+
+  // Answer a run paused on a source-credential request (the API-extractor path).
+  // The secrets go straight to .../credentials and are never kept client-side.
+  const submitCredentials = useCallback(
+    async (credentials: Record<string, unknown>) => {
+      const runId = currentRunIdRef.current;
+      const prompt = credentialPrompt;
+      if (!migrationId || !runId || !prompt) return;
+      setBusy(true);
+      setCredentialPrompt(null); // optimistically clear; restored on failure
+      try {
+        appendUserMessage(`Connected ${prompt.sourceName}.`);
+        await client.submitCredentials(migrationId, runId, credentials, prompt.connectionId);
+        setAgentSettled(false);
+        setAgentElapsed(0);
+        await streamCurrent(migrationId);
+        setAgentSettled(true);
+        const run = await client.getRun(migrationId, runId);
+        if (run.status === "awaiting_approval") {
+          setPreviewReady(true);
+          await rememberMigration(migrationId, {
+            status: "awaiting_review",
+            last_thread_sequence: cursorRef.current ?? null,
+          });
+        } else if (run.status === "blocked") {
+          await applyBlocked(migrationId, run);
+        } else if (run.status === "completed") {
+          setReport(run.report);
+          await rememberMigration(migrationId, {
+            status: "completed",
+            report: run.report ?? null,
+            last_thread_sequence: cursorRef.current ?? null,
+          });
+          setPhase("done");
+          clearProgress();
+        } else if (run.status === "failed" || run.status === "canceled") {
+          await rememberMigration(migrationId, { status: "failed", last_thread_sequence: cursorRef.current ?? null });
+          throw new Error("That didn't complete. Please retry.");
+        }
+      } catch (e) {
+        setCredentialPrompt(prompt); // restore the form so the user can retry
+        fail(e);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [client, migrationId, credentialPrompt, appendUserMessage, streamCurrent, rememberMigration, applyBlocked, clearProgress],
   );
 
   const execute = useCallback(async () => {
@@ -602,11 +730,7 @@ function Flow({
         setPhase("done");
         clearProgress();
       } else if (run.status === "blocked") {
-        setQuestions((prev) => (run.questions?.length ? run.questions : prev));
-        await rememberMigration(migrationId, {
-          status: "blocked",
-          last_thread_sequence: cursorRef.current ?? null,
-        });
+        await applyBlocked(migrationId, run);
         setPhase("agent");
       } else {
         await rememberMigration(migrationId, { status: "failed", last_thread_sequence: cursorRef.current ?? null });
@@ -618,7 +742,7 @@ function Flow({
       setBusy(false);
       setImporting(false);
     }
-  }, [client, migrationId, selectedSlugs, streamCurrent, saveProgress, rememberMigration, clearProgress]);
+  }, [client, migrationId, selectedSlugs, streamCurrent, saveProgress, rememberMigration, applyBlocked, clearProgress]);
 
   // Demo-only stand-in for `execute`. The live "Import" commits over the Vern
   // API; that button is disabled in this demo, so instead of calling the API we
@@ -688,11 +812,7 @@ function Flow({
             last_thread_sequence: cursorRef.current ?? null,
           });
         } else if (run.status === "blocked") {
-          setQuestions((prev) => (run.questions?.length ? run.questions : prev));
-          await rememberMigration(migrationId, {
-            status: "blocked",
-            last_thread_sequence: cursorRef.current ?? null,
-          });
+          await applyBlocked(migrationId, run);
         } else if (run.status === "failed" || run.status === "canceled") {
           await rememberMigration(migrationId, { status: "failed", last_thread_sequence: cursorRef.current ?? null });
           throw new Error("The update did not complete. Please retry.");
@@ -704,7 +824,7 @@ function Flow({
         setBusy(false);
       }
     },
-    [client, migrationId, selectedSlugs, appendUserMessage, streamCurrent, saveProgress, rememberMigration],
+    [client, migrationId, selectedSlugs, appendUserMessage, streamCurrent, saveProgress, rememberMigration, applyBlocked],
   );
 
   // Resume an in-progress import: rebuild the feed from the durable thread,
@@ -768,13 +888,22 @@ function Flow({
       // Only show a question if the run is *currently* blocked. A request_input
       // replayed from history may already have been answered.
       if (run.status === "blocked") {
-        setQuestions(run.questions?.length ? run.questions : lastReplayedQuestions);
+        const cred =
+          run.blocked_reason === "credentials" ? credentialPromptFromRun(run.credential_request) : null;
+        if (cred) {
+          setCredentialPrompt(cred);
+          setQuestions([]);
+        } else {
+          setCredentialPrompt(null);
+          setQuestions(run.questions?.length ? run.questions : lastReplayedQuestions);
+        }
         await rememberMigration(mId, {
           status: "blocked",
           last_thread_sequence: cursorRef.current ?? null,
         });
       } else {
         setQuestions([]);
+        setCredentialPrompt(null);
         if (run.status === "awaiting_approval") {
           setPreviewReady(true);
         } else if (run.status === "completed") {
@@ -835,6 +964,7 @@ function Flow({
     setAgentSettled(false);
     setAgentElapsed(0);
     setQuestions([]);
+    setCredentialPrompt(null);
     setPreview([]);
     setPreviewReady(false);
     setReport(undefined);
@@ -920,6 +1050,7 @@ function Flow({
     setAgentSettled(false);
     setAgentElapsed(0);
     setQuestions([]);
+    setCredentialPrompt(null);
     setPreview([]);
     setPreviewReady(false);
     setReport(undefined);
@@ -1013,6 +1144,27 @@ function Flow({
               </Button>
             }
           />
+          {selectedSource && (
+            <div className="flex flex-col gap-3 rounded-xl border border-dashed border-zinc-200 bg-zinc-50/60 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-zinc-700">
+                  Or pull straight from {selectedSource}
+                </p>
+                <p className="text-xs text-zinc-500">
+                  Skip the export — we&apos;ll connect to {selectedSource}&apos;s API and import directly.
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                onClick={() => void apiImport()}
+                disabled={busy || capReached}
+                loading={busy}
+                className="shrink-0"
+              >
+                Connect {selectedSource}
+              </Button>
+            </div>
+          )}
           <div className="flex items-center justify-between">
             <Button variant="ghost" onClick={() => setPhase("source")} disabled={busy}>
               Back
@@ -1028,17 +1180,21 @@ function Flow({
         <div className="flex flex-col gap-5">
           {/* When the agent is asking, surface the question above the live
               activity stream so the user sees what to act on first. */}
-          {questions.length > 0 && (
-            <Questions questions={questions} onSubmit={submitAnswers} submitting={busy} />
+          {credentialPrompt ? (
+            <SourceCredentials prompt={credentialPrompt} onSubmit={submitCredentials} submitting={busy} />
+          ) : (
+            questions.length > 0 && (
+              <Questions questions={questions} onSubmit={submitAnswers} submitting={busy} />
+            )
           )}
           <AgentActivity
             feed={feed}
             settled={agentSettled}
-            awaitingInput={questions.length > 0}
+            awaitingInput={questions.length > 0 || !!credentialPrompt}
             kind={runKind}
             elapsed={agentElapsed}
           />
-          {agentSettled && questions.length === 0 && previewReady && (
+          {agentSettled && questions.length === 0 && !credentialPrompt && previewReady && (
             <div className="flex justify-end">
               <Button onClick={preview.length > 0 ? () => setPhase("review") : viewPreview} loading={busy}>
                 {preview.length > 0 ? "Return to review" : "View preview"}

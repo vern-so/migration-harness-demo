@@ -204,6 +204,35 @@ export function makeClient(slug: string) {
     return jget(`${base}/vern/migrations/${migrationId}/preview`);
   }
 
+  // Register (or update) the API source this migration extracts from. Creating
+  // it with no `credentials` leaves the connection unconfigured — the agent then
+  // asks the end-customer for them mid-run via a credential request.
+  async function saveSourceConnection(
+    migrationId: string,
+    body: {
+      source_key: string;
+      config?: Record<string, unknown>;
+      selected_streams?: string[] | null;
+      credentials?: Record<string, unknown>;
+    },
+  ): Promise<unknown> {
+    return jpost(`${base}/vern/migrations/${migrationId}/source-connection`, body);
+  }
+
+  // Answer a run blocked on a source-credential request. Secrets go only here —
+  // never to the messages endpoint, which rejects credential blocks.
+  async function submitCredentials(
+    migrationId: string,
+    runId: string,
+    credentials: Record<string, unknown>,
+    connectionId?: string,
+  ): Promise<{ run_id: string; status: string }> {
+    return jpost(`${base}/vern/migrations/${migrationId}/runs/${runId}/credentials`, {
+      credentials,
+      ...(connectionId ? { connection_id: connectionId } : {}),
+    });
+  }
+
   async function generateSampleData(input: {
     source: string | null;
     templates: Template[];
@@ -327,6 +356,8 @@ export function makeClient(slug: string) {
     getRun,
     answerQuestions,
     getPreview,
+    saveSourceConnection,
+    submitCredentials,
     generateSampleData,
     getThreadSnapshot,
     exportUrl,

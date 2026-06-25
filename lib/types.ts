@@ -57,7 +57,23 @@ export type AgentQuestion = {
 export type RunReport = {
   inserted?: number;
   invalidCellCount?: number;
+  perSheet?: { templateName: string; sheetId: string; rowCount: number }[];
+  // Optional per-column fill/distinct profile of sources vs. outputs (null when
+  // the run predates coverage profiling).
+  coverage?: Record<string, unknown> | null;
   [k: string]: unknown;
+};
+
+// A blocked run awaiting source API credentials (blocked_reason === "credentials").
+// Carries the field schema + where-to-find-it guidance, never the secret values.
+// Answered via POST .../runs/{run_id}/credentials — never the messages endpoint.
+export type CredentialRequest = {
+  connection_id: string;
+  source_key: string;
+  source_name: string;
+  reason?: string;
+  guidance?: string;
+  schema: unknown;
 };
 
 // One event from the agent's activity thread (SSE stream or snapshot).
@@ -85,7 +101,11 @@ export type Run = {
   run_id: string;
   status: RunStatus;
   poll_url?: string;
+  // When status is "blocked": "question" (with `questions`) or "credentials"
+  // (with `credential_request`).
+  blocked_reason?: "question" | "credentials" | string;
   questions?: AgentQuestion[];
+  credential_request?: CredentialRequest | null;
   report?: RunReport;
   message?: string;
   error?: string;
