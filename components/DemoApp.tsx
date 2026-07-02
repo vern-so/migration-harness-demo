@@ -5,6 +5,7 @@ import { readableFg, softTint, type Brand } from "@/lib/branding";
 import type { AgentQuestion, DemoMigration, Run, RunReport, SampleCsvFile, Source, Template, ThreadEvent } from "@/lib/types";
 import { ApiError, contentTypeFor, makeClient, type VernClient } from "@/lib/client";
 import { normalizePreview, type PreviewSheet } from "@/lib/preview";
+import { downloadAllAsZip } from "@/lib/download";
 import { Shell } from "@/components/Shell";
 import { Stepper, type StepKey } from "@/components/Stepper";
 import { Dropzone } from "@/components/Dropzone";
@@ -575,7 +576,8 @@ function Flow({
     setBusy(true);
     setImporting(true);
     setRunKind("execute");
-    setFeed([]);
+    // Import resumes the same thread rather than starting a fresh run, so keep
+    // the existing feed — the import activity streams in beneath the mapping log.
     setQuestions([]);
     setAgentSettled(false);
     setAgentElapsed(0);
@@ -622,24 +624,6 @@ function Flow({
       setImporting(false);
     }
   }, [client, migrationId, selectedSlugs, streamCurrent, saveProgress, rememberMigration, applyBlocked, clearProgress]);
-
-  // Demo-only stand-in for `execute`. The live "Import" commits over the Vern
-  // API; that button is disabled in this demo, so instead of calling the API we
-  // synthesize the completion screen straight from the validated preview — the
-  // numbers the user is already looking at — so the flow still runs end to end.
-  const pseudoExecute = useCallback(() => {
-    setError(null);
-    setBusy(true);
-    setRunKind("execute");
-    const inserted = preview.reduce((sum, s) => sum + s.total, 0);
-    const invalidCellCount = preview.reduce((sum, s) => sum + s.invalidCells, 0);
-    // A brief delay so the import reads as work being done, not an instant jump.
-    setTimeout(() => {
-      setReport({ inserted, invalidCellCount });
-      setPhase("done");
-      setBusy(false);
-    }, 1100);
-  }, [preview]);
 
   // "Fix": send free-text feedback to the agent as an `update` run, then let
   // the user view the refreshed preview when they are ready.
@@ -1047,82 +1031,71 @@ function Flow({
         </div>
       )}
 
-      {phase === "review" && (
-        <div className="flex flex-col gap-5">
-          <div>
-            <h2 className="text-base font-semibold text-zinc-900">Review the proposed import</h2>
-            <p className="mt-0.5 text-sm text-zinc-500">
-              Every row has been mapped to your fields and validated. Flagged cells are kept and
-              marked, never silently dropped.
-            </p>
-          </div>
-          {runKind === "execute" && importing ? (
-            <AgentActivity feed={feed} settled={agentSettled} kind="execute" elapsed={agentElapsed} />
-          ) : (
+      {phase === "review" &&
+        (importing ? (
+          // Import doesn't spin up a separate run — it resumes the same agent
+          // thread and lets the import tool run inline, so the activity stream
+          // just continues from where mapping left off.
+          <AgentActivity feed={feed} settled={agentSettled} kind="execute" elapsed={agentElapsed} />
+        ) : (
+          <div className="flex flex-col gap-5">
+            <div>
+              <h2 className="text-base font-semibold text-zinc-900">Review the proposed import</h2>
+              <p className="mt-0.5 text-sm text-zinc-500">
+                Every row has been mapped to your fields and validated. Flagged cells are kept and
+                marked, never silently dropped.
+              </p>
+            </div>
             <Preview sheets={preview} />
-          )}
 
-          {fixOpen && (
-            <div className="rounded-xl border border-zinc-200 bg-white p-4">
-              <label className="text-sm font-medium text-zinc-800">
-                What would you like to change?
-              </label>
-              <textarea
-                autoFocus
-                rows={3}
-                value={fixText}
-                onChange={(e) => setFixText(e.target.value)}
-                placeholder="e.g. Map 'Settled' status to Archived, and use the company domain for missing emails."
-                className="mt-2 w-full resize-none rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none focus:border-[var(--brand)]"
-              />
-              <div className="mt-3 flex justify-end gap-2">
-                <Button variant="ghost" onClick={() => setFixOpen(false)} disabled={busy}>
-                  Cancel
+            {fixOpen && (
+              <div className="rounded-xl border border-zinc-200 bg-white p-4">
+                <label className="text-sm font-medium text-zinc-800">
+                  What would you like to change?
+                </label>
+                <textarea
+                  autoFocus
+                  rows={3}
+                  value={fixText}
+                  onChange={(e) => setFixText(e.target.value)}
+                  placeholder="e.g. Map 'Settled' status to Archived, and use the company domain for missing emails."
+                  className="mt-2 w-full resize-none rounded-lg border border-zinc-300 px-3 py-2 text-sm outline-none focus:border-[var(--brand)]"
+                />
+                <div className="mt-3 flex justify-end gap-2">
+                  <Button variant="ghost" onClick={() => setFixOpen(false)} disabled={busy}>
+                    Cancel
+                  </Button>
+                  <Button onClick={() => applyFix(fixText)} disabled={!fixText.trim()} loading={busy}>
+                    Update my import
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className="flex items-center justify-between">
+              <Button
+                variant="ghost"
+                disabled={busy}
+                onClick={() => {
+                  setFixOpen(false);
+                  setPhase("agent");
+                }}
+              >
+                Back
+              </Button>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" onClick={() => setFixOpen((o) => !o)} disabled={busy}>
+                  Fix
                 </Button>
-                <Button onClick={() => applyFix(fixText)} disabled={!fixText.trim()} loading={busy}>
-                  Update my import
+                {/* Approve the preview and resume the thread — the agent runs the
+                    import tool over the live Vern API from here. */}
+                <Button onClick={execute} loading={busy}>
+                  Import my data
                 </Button>
               </div>
-            </div>
-          )}
-
-          <div className="flex items-center justify-between">
-            <Button
-              variant="ghost"
-              disabled={busy}
-              onClick={() => {
-                setFixOpen(false);
-                setPhase("agent");
-              }}
-            >
-              Back
-            </Button>
-            <div className="flex items-center gap-2">
-              <Button variant="outline" onClick={() => setFixOpen((o) => !o)} disabled={busy}>
-                Fix
-              </Button>
-              {/* The live import commits over the Vern API (`execute`, wired and
-                  ready). It's disabled in this demo; the button beside it
-                  simulates the result from the validated preview instead. */}
-              <div className="group relative">
-                <Button onClick={execute} disabled>
-                  Import
-                </Button>
-                <span
-                  role="tooltip"
-                  className="pointer-events-none absolute bottom-full right-0 z-20 mb-2 w-64 rounded-lg bg-zinc-900 px-3 py-2 text-left text-[11px] leading-snug text-zinc-100 opacity-0 shadow-lg transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100"
-                >
-                  Wiring this to your live Vern API is a one-line change. This demo
-                  simulates the import from the validated preview.
-                </span>
-              </div>
-              <Button onClick={pseudoExecute} loading={busy}>
-                Simulate import
-              </Button>
             </div>
           </div>
-        </div>
-      )}
+        ))}
 
       {phase === "done" && migrationId && (
         <div className="flex flex-col gap-5">
@@ -1255,16 +1228,17 @@ function MigrationHistory({
   if (rows.length === 0 && completeCount === 0) return null;
   const names = new Map(templates.map((t) => [t.slug, t.name]));
   const downloadAll = (row: DemoMigration) => {
-    row.templates.forEach((slug, i) => {
-      setTimeout(() => {
-        const a = document.createElement("a");
-        a.href = client.exportUrl(row.migration_id, slug);
-        a.download = `${slug}.csv`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      }, i * 350);
-    });
+    if (row.templates.length === 1) {
+      const slug = row.templates[0];
+      const a = document.createElement("a");
+      a.href = client.exportUrl(row.migration_id, slug);
+      a.download = `${slug}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return;
+    }
+    downloadAllAsZip(client, row.migration_id, row.templates, "migration-exports.zip");
   };
 
   return (

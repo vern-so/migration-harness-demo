@@ -4,6 +4,7 @@ import type { VernClient } from "@/lib/client";
 import { CheckIcon, DownloadIcon } from "./Icons";
 import { Button } from "./Button";
 import { BOOK_A_CALL_URL, DOCS_URL } from "@/lib/site";
+import { downloadAllAsZip } from "@/lib/download";
 
 export function Report({
   report,
@@ -20,18 +21,24 @@ export function Report({
   const invalid = num(report?.invalidCellCount);
   const multiple = templates.length > 1;
 
-  // "Download all" triggers each sheet's CSV (same-origin, so `download` sticks).
+  // "Download all" bundles every sheet's CSV into a single .zip. A single
+  // template just downloads its CSV directly (no point zipping one file).
   const downloadAll = () => {
-    templates.forEach((t, i) => {
-      setTimeout(() => {
-        const a = document.createElement("a");
-        a.href = client.exportUrl(migrationId, t.slug);
-        a.download = `${t.slug}.csv`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      }, i * 350);
-    });
+    if (!multiple) {
+      const a = document.createElement("a");
+      a.href = client.exportUrl(migrationId, templates[0]?.slug ?? "");
+      a.download = `${templates[0]?.slug ?? "clean"}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return;
+    }
+    downloadAllAsZip(
+      client,
+      migrationId,
+      templates.map((t) => t.slug),
+      "migration-exports.zip",
+    );
   };
 
   return (
@@ -59,7 +66,7 @@ export function Report({
         <Button variant="secondary" onClick={downloadAll} className="w-full sm:w-auto">
           <DownloadIcon className="h-4 w-4" />
           {multiple
-            ? `Download all (${templates.length} files)`
+            ? `Download all (${templates.length} files, .zip)`
             : `Download ${templates[0]?.slug ?? "clean"}.csv`}
         </Button>
         <p className="mt-2 text-xs text-zinc-400">
