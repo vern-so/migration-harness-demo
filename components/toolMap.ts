@@ -78,6 +78,7 @@ export const TOOL_MAP: Record<string, ToolDef> = {
     dynamic: (a) => (str(a.url) ? `Reading ${str(a.url)}` : null),
   },
   remember_source_research: { phase: "research", icon: "Save", copy: "Saving what we learned about this source" },
+  remember_profile_preference: { phase: "research", icon: "Save", copy: "Saving your preferences for next time" },
   read_source: {
     phase: "research",
     icon: "Table2",
@@ -89,6 +90,12 @@ export const TOOL_MAP: Record<string, ToolDef> = {
     icon: "FileSearch",
     copy: "Analyzing your source data",
     dynamic: (a) => (str(a.fileName) ? `Analyzing the data in “${str(a.fileName)}”` : null),
+  },
+  profile_source: {
+    phase: "research",
+    icon: "Columns3",
+    copy: "Profiling your source data",
+    dynamic: (a) => (str(a.fileName) ? `Profiling “${str(a.fileName)}”` : null),
   },
   extract_tables: {
     phase: "research",
@@ -138,7 +145,55 @@ export const TOOL_MAP: Record<string, ToolDef> = {
   dry_run: { phase: "recipe", icon: "FlaskConical", copy: "Testing the recipe on your data" },
   view_preview: { phase: "recipe", icon: "Table2", copy: "Reviewing the preview output" },
   ask_user: { phase: "hitl", icon: "MessageCircleQuestion", copy: "Asking you a question" },
+  request_source_credentials: {
+    phase: "hitl",
+    icon: "MessageCircleQuestion",
+    copy: "Asking you for connection credentials",
+  },
+  // API source connectors — only active when the run pulls from a source API
+  // (HubSpot, QuickBooks, Xero, …) instead of uploaded files. The extractor
+  // authoring tools mirror the recipe tools above.
+  list_api_extractors: { phase: "research", icon: "FileSearch", copy: "Checking your connected sources" },
+  preflight_source_connection: { phase: "research", icon: "Globe", copy: "Checking the source connection" },
+  read_source_spec: { phase: "research", icon: "BookOpen", copy: "Reading the source’s API spec" },
+  get_prior_extractor: { phase: "research", icon: "FileCode2", copy: "Looking up your previous extractor" },
+  draft_source_manifest: {
+    phase: "recipe",
+    icon: "Wand2",
+    copy: "Drafting the connector spec",
+    dynamic: (a) => (str(a.name) ? `Drafting the ${str(a.name)} connector` : null),
+  },
+  save_source_manifest: { phase: "recipe", icon: "Save", copy: "Saving the connector spec" },
+  view_source_manifest: { phase: "recipe", icon: "FileText", copy: "Reviewing the connector spec" },
+  write_extractor: { phase: "recipe", icon: "Wand2", copy: "Writing the data extractor" },
+  view_extractor: {
+    phase: "recipe",
+    icon: "FileText",
+    copy: "Reading the extractor",
+    dynamic: (a) =>
+      num(a.startLine) != null && num(a.endLine) != null
+        ? `Reading the extractor (${num(a.startLine)}–${num(a.endLine)})`
+        : null,
+  },
+  find_in_extractor: {
+    phase: "recipe",
+    icon: "Search",
+    copy: "Searching the extractor",
+    dynamic: (a) => (str(a.query) ? `Finding “${str(a.query)}” in the extractor` : null),
+  },
+  replace_extractor_lines: {
+    phase: "recipe",
+    icon: "Pencil",
+    copy: "Editing the extractor",
+    dynamic: (a) =>
+      num(a.startLine) != null && num(a.endLine) != null
+        ? `Editing the extractor (${num(a.startLine)}–${num(a.endLine)})`
+        : null,
+  },
+  dry_run_extractor: { phase: "recipe", icon: "FlaskConical", copy: "Testing the extractor on live data" },
+  run_api_extractor: { phase: "execute", icon: "DatabaseZap", copy: "Pulling your data from the API" },
   execute_import: { phase: "execute", icon: "DatabaseZap", copy: "Importing your data" },
+  finish_import: { phase: "execute", icon: "FileText", copy: "Wrapping up the import" },
   view_invalid_cells: {
     phase: "execute",
     icon: "CircleAlert",
